@@ -294,17 +294,20 @@ export default function FireChatV2() {
         }
       }
 
-      setVerifyMsg(request.initiatedByMe ? 'Waiting for your trusted device to accept…' : 'Preparing emoji verification…')
+      setVerifyMsg(request.initiatedByMe ? 'Waiting for your trusted device to accept…' : 'Accepted. Start emoji verification on the other device.')
 
       let verifier = request.verifier
-      for (let attempt = 0; attempt < 80 && !verifier; attempt += 1) {
+      for (let attempt = 0; attempt < 480 && !verifier; attempt += 1) {
         const phase = request.phase
 
         if (phase === VerificationPhase.Done) {
           await finishVerification('Verified with emoji')
           return
         }
-        if (phase === VerificationPhase.Cancelled) throw new Error('Verification was cancelled')
+        if (phase === VerificationPhase.Cancelled) {
+          const code = request.cancellationCode ? ` (${request.cancellationCode})` : ''
+          throw new Error(`Verification was cancelled${code}`)
+        }
 
         if (phase === VerificationPhase.Started && request.verifier) {
           verifier = request.verifier
@@ -312,14 +315,13 @@ export default function FireChatV2() {
         }
 
         if (phase === VerificationPhase.Ready) {
-          verifier = request.verifier || await request.startVerification('m.sas.v1')
-          break
+          setVerifyMsg('Trusted device accepted. Start the emoji comparison on that device; FireChat will join it automatically.')
         }
 
         await sleep(250)
       }
 
-      if (!verifier) throw new Error('The trusted device did not become ready for emoji verification')
+      if (!verifier) throw new Error('The trusted device did not start emoji verification before the request expired')
       verifierRef.current = verifier
 
       verifier.on(VerifierEvent.ShowSas, (sas) => {
@@ -336,7 +338,8 @@ export default function FireChatV2() {
         sasFlowRef.current = null
         setSasData(null)
         setVerificationReq(null)
-        setVerifyMsg(`Verification cancelled: ${error?.reason || error?.message || 'unknown'}`)
+        const reason = error?.reason || error?.message || request.cancellationCode || 'unknown'
+        setVerifyMsg(`Verification cancelled: ${reason}`)
       })
 
       void verifier.verify()
@@ -444,7 +447,8 @@ export default function FireChatV2() {
           setSasData(null)
           verifierRef.current = null
           sasFlowRef.current = null
-          setVerifyMsg('Verification cancelled')
+          const reason = request.cancellationCode ? ` (${request.cancellationCode})` : ''
+          setVerifyMsg(`Verification cancelled${reason}`)
         } else if (request.initiatedByMe && [VerificationPhase.Ready, VerificationPhase.Started].includes(request.phase)) {
           void runSasVerification(request)
         }
