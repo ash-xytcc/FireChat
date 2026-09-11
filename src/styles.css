@@ -58,12 +58,22 @@ a { color: inherit; }
 .login-intro p { max-width: 650px; color: #c8ccd5; font-size: 1rem; line-height: 1.55; }
 .login-card { padding: 18px; }
 .login-form { gap: 10px; }
+.auth-tabs { display: flex; gap: 8px; margin-bottom: 16px; }
+.auth-tab { flex: 1; border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; background: #10131a; color: var(--muted); font-weight: 800; cursor: pointer; }
+.auth-tab.active { color: #111318; border-color: transparent; background: linear-gradient(145deg, var(--accent), var(--accent-2)); }
+.advanced-auth { border: 1px solid var(--line); border-radius: 12px; background: #10131a; }
+.advanced-auth summary { cursor: pointer; padding: 10px 12px; color: var(--muted); font-size: .86rem; }
+.advanced-auth-body { padding: 0 10px 10px; display: grid; gap: 6px; }
 
 .account-bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
 .account-meta { margin-left: auto; color: var(--muted); font-size: .83rem; overflow-wrap: anywhere; }
 
 .verification-card { margin-bottom: 12px; }
 .verification-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.recovery-row .input { flex: 1 1 320px; }
+.verification-divider { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--line); }
+.recovery-save-card { margin-bottom: 12px; border-color: rgba(255,112,67,.55); }
+.recovery-key-display { margin-top: 12px; padding: 14px; border: 1px solid var(--line); border-radius: 12px; background: #0f1218; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; line-height: 1.5; overflow-wrap: anywhere; user-select: all; }
 .sas-grid { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 12px; }
 .sas-item { min-width: 58px; text-align: center; }
 .sas-emoji { font-size: 28px; line-height: 1.1; }
