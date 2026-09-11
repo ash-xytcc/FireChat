@@ -1,6 +1,12 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createClient, IndexedDBStore, IndexedDBCryptoStore } from 'matrix-js-sdk'
-import { CryptoEvent, VerifierEvent, canAcceptVerificationRequest } from 'matrix-js-sdk/lib/crypto-api'
+import {
+  CryptoEvent,
+  VerificationPhase,
+  VerifierEvent,
+  canAcceptVerificationRequest,
+  decodeRecoveryKey,
+} from 'matrix-js-sdk/lib/crypto-api'
 
 const GLOBAL_MATRIX_KEY = '__firechat_matrix_client__'
 const SESSION_KEY = 'firechat_matrix_session'
@@ -92,6 +98,10 @@ function eventToMessage(event, room = null) {
   }
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms))
+}
+
 async function deleteIDB(name) {
   try {
     if (!name || !window.indexedDB) return
@@ -147,8 +157,9 @@ async function getDeviceVerifiedTruth(client) {
       const result = await crypto.getDeviceVerificationStatus(userId, deviceId)
       if (result === true || result === false) return result
       if (result && typeof result === 'object') {
-        if (result.isVerified === true || result.verified === true || result.isCrossSigningVerified === true) return true
-        if (result.isVerified === false || result.verified === false) return false
+        if (typeof result.isVerified === 'function') return !!result.isVerified()
+        if (result.crossSigningVerified === true || result.localVerified === true || result.verified === true) return true
+        if (result.crossSigningVerified === false && result.localVerified === false) return false
       }
     }
 
@@ -156,6 +167,7 @@ async function getDeviceVerifiedTruth(client) {
       const result = await crypto.getDeviceVerification(userId, deviceId)
       if (result === true || result === false) return result
       if (result && typeof result === 'object') {
+        if (typeof result.isVerified === 'function') return !!result.isVerified()
         if (result.isVerified === true || result.verified === true) return true
         if (result.isVerified === false || result.verified === false) return false
       }
@@ -179,6 +191,8 @@ export default function FireChat() {
   const [verificationReq, setVerificationReq] = useState(null)
   const [sasData, setSasData] = useState(null)
   const [verifyMsg, setVerifyMsg] = useState('')
+  const [recoveryKey, setRecoveryKey] = useState('')
+  const [recoveryBusy, setRecoveryBusy] = useState(false)
   const [rooms, setRooms] = useState([])
   const [activeRoomId, setActiveRoomId] = useState(null)
   const [messages, setMessages] = useState([])
@@ -189,6 +203,7 @@ export default function FireChat() {
 
   const clientRef = useRef(null)
   const verifierRef = useRef(null)
+  const recoveryKeyRef = useRef(null)
   const activeRoomIdRef = useRef(null)
   const stoppedRef = useRef(false)
 
@@ -257,7 +272,7 @@ export default function FireChat() {
 
   const refreshVerificationTruth = useCallback(async () => {
     const client = clientRef.current
-    if (!client) return
+    if (!client) return null
     const cryptoOk = await detectCryptoReady(client)
     setCryptoReady(cryptoOk)
     const truth = await getDeviceVerifiedTruth(client)
@@ -268,6 +283,7 @@ export default function FireChat() {
     } else if (truth === false) {
       setDeviceVerified(false)
     }
+    return truth
   }, [])
 
   const persistSessionFromClient = useCallback((client, fallbackSession = session) => {
@@ -379,6 +395,14 @@ export default function FireChat() {
         deviceId: session.deviceId || undefined,
         store,
         cryptoStore,
+        cryptoCallbacks: {
+          getSecretStorageKey: async ({ keys }) => {
+            const privateKey = recoveryKeyRef.current
+            if (!privateKey) return null
+            const keyId = Object.keys(keys || {})[0]
+            return keyId ? [keyId, privateKey] : null
+          },
+        },
       })
       setGlobalMatrix({ client, hsUrl: baseUrl, userId: uid, accessToken: session.accessToken, deviceId: session.deviceId || '' })
       log('Connecting…')
@@ -395,10 +419,26 @@ export default function FireChat() {
     }
 
     function onVerificationReq(request) {
-      setVerificationReq(request)
-      setSasData(null)
-      setVerifyMsg('')
-      request.on?.('change', () => setVerificationReq(request))
+      void getDeviceVerifiedTruth(client).then((alreadyVerified) => {
+        if (alreadyVerified === true) {
+          cleanupVerification('')
+          return
+        }
+
+        setVerificationReq(request)
+        setSasData(null)
+        setVerifyMsg('')
+        request.on?.('change', () => {
+          if (request.phase === VerificationPhase.Done) {
+            markThisDeviceVerified()
+            cleanupVerification('Verified')
+            return
+          }
+          if (request.phase === VerificationPhase.Cancelled) {
+            cleanupVerification('Verification cancelled')
+          }
+        })
+      })
     }
 
     function onSync(state) {
@@ -444,13 +484,17 @@ export default function FireChat() {
 
       persistSessionFromClient(client, session)
       refreshRooms()
-      await refreshVerificationTruth()
+      const alreadyVerified = await refreshVerificationTruth()
 
-      try {
-        const crypto = client.getCrypto?.()
-        const pending = crypto?.getVerificationRequestsToDeviceInProgress?.(client.getUserId?.() || uid)
-        if (pending?.length) onVerificationReq(pending[0])
-      } catch {}
+      if (alreadyVerified !== true) {
+        try {
+          const crypto = client.getCrypto?.()
+          const pending = crypto?.getVerificationRequestsToDeviceInProgress?.(client.getUserId?.() || uid)
+          if (pending?.length) onVerificationReq(pending[0])
+        } catch {}
+      } else {
+        cleanupVerification('')
+      }
 
       client.on('sync', onSync)
       client.on(CryptoEvent.VerificationRequestReceived, onVerificationReq)
@@ -473,7 +517,16 @@ export default function FireChat() {
       } catch {}
       clientRef.current = null
     }
-  }, [loggedIn, log, persistSessionFromClient, refreshRooms, refreshVerificationTruth, session])
+  }, [
+    cleanupVerification,
+    loggedIn,
+    log,
+    markThisDeviceVerified,
+    persistSessionFromClient,
+    refreshRooms,
+    refreshVerificationTruth,
+    session,
+  ])
 
   useEffect(() => {
     function refreshWhenVisible() {
@@ -523,6 +576,7 @@ export default function FireChat() {
     try { client?.stopClient?.() } catch {}
     try { client?.removeAllListeners?.() } catch {}
     clientRef.current = null
+    recoveryKeyRef.current = null
     clearGlobalMatrix()
     removeKey(SESSION_KEY)
     removeKey(verifiedKeyFor(userId, deviceId))
@@ -530,6 +584,7 @@ export default function FireChat() {
     setReady(false)
     setCryptoReady(false)
     setDeviceVerified(false)
+    setRecoveryKey('')
     setRooms([])
     setActiveRoomId(null)
     setMessages([])
@@ -544,6 +599,7 @@ export default function FireChat() {
     try { client?.stopClient?.() } catch {}
     try { client?.removeAllListeners?.() } catch {}
     clientRef.current = null
+    recoveryKeyRef.current = null
     clearGlobalMatrix()
     removeKey(SESSION_KEY)
     removeKey(verifiedKeyFor(userId, deviceId))
@@ -552,11 +608,41 @@ export default function FireChat() {
     setReady(false)
     setCryptoReady(false)
     setDeviceVerified(false)
+    setRecoveryKey('')
     setRooms([])
     setActiveRoomId(null)
     setMessages([])
     cleanupVerification('')
     setStatus('Local Matrix storage reset')
+  }
+
+  async function verifyWithRecoveryKey() {
+    const client = clientRef.current
+    const crypto = client?.getCrypto?.()
+    const enteredKey = recoveryKey.trim()
+    if (!client || !crypto || !enteredKey || recoveryBusy) return
+
+    setRecoveryBusy(true)
+    setVerifyMsg('Checking recovery key…')
+    try {
+      recoveryKeyRef.current = decodeRecoveryKey(enteredKey)
+      await crypto.bootstrapCrossSigning({})
+
+      for (let attempt = 0; attempt < 10; attempt += 1) {
+        const truth = await refreshVerificationTruth()
+        if (truth === true) break
+        await sleep(300)
+      }
+
+      markThisDeviceVerified()
+      setRecoveryKey('')
+      cleanupVerification('Verified with recovery key')
+    } catch (error) {
+      recoveryKeyRef.current = null
+      setVerifyMsg(`Recovery key failed: ${error?.message || String(error)}`)
+    } finally {
+      setRecoveryBusy(false)
+    }
   }
 
   async function requestOwnVerification() {
@@ -571,7 +657,7 @@ export default function FireChat() {
       const request = await crypto.requestOwnUserVerification()
       setVerificationReq(request)
       setSasData(null)
-      setVerifyMsg('Verification request sent. Accept it on your other device, then start SAS here.')
+      setVerifyMsg('Verification request sent. Accept it on your other device, then start emoji verification here.')
     } catch (error) {
       setVerifyMsg(error?.message || String(error))
     }
@@ -597,12 +683,8 @@ export default function FireChat() {
   async function acceptVerification() {
     if (!verificationReq) return
     try {
-      if (!canAcceptVerificationRequest(verificationReq)) {
-        setVerifyMsg('This verification is already in progress.')
-        return
-      }
-      await verificationReq.accept()
-      setVerifyMsg('Accepted. Start SAS to compare codes.')
+      if (canAcceptVerificationRequest(verificationReq)) await verificationReq.accept()
+      setVerifyMsg('Accepted. Start emoji verification once the other device is ready.')
     } catch (error) {
       setVerifyMsg(error?.message || String(error))
     }
@@ -612,8 +694,30 @@ export default function FireChat() {
     if (!verificationReq || verifierRef.current) return
     try {
       setSasData(null)
-      setVerifyMsg('')
-      const verifier = await verificationReq.startVerification('m.sas.v1')
+      setVerifyMsg('Preparing emoji verification…')
+
+      if (canAcceptVerificationRequest(verificationReq)) await verificationReq.accept()
+
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        if (verificationReq.phase === VerificationPhase.Ready || verificationReq.phase === VerificationPhase.Started) break
+        if (verificationReq.phase === VerificationPhase.Done) {
+          markThisDeviceVerified()
+          cleanupVerification('Verified')
+          return
+        }
+        if (verificationReq.phase === VerificationPhase.Cancelled) {
+          cleanupVerification('Verification cancelled')
+          return
+        }
+        await sleep(250)
+      }
+
+      if (verificationReq.phase !== VerificationPhase.Ready && verificationReq.phase !== VerificationPhase.Started) {
+        setVerifyMsg('The other device has not accepted the verification yet. Accept it there, then try Start emoji verification again.')
+        return
+      }
+
+      const verifier = verificationReq.verifier || await verificationReq.startVerification('m.sas.v1')
       verifierRef.current = verifier
 
       verifier.on(VerifierEvent.ShowSas, (sas) => {
@@ -626,14 +730,15 @@ export default function FireChat() {
             }).filter(Boolean)
           : null
         setSasData({ emoji, decimal: payload.decimal || null, confirm: sas.confirm, mismatch: sas.mismatch })
+        setVerifyMsg('Compare these with the other trusted session.')
       })
 
-      verifier.on(VerifierEvent.Done, () => {
-        markThisDeviceVerified()
-        cleanupVerification('Verified')
-      })
-      verifier.on(VerifierEvent.Cancel, (error) => cleanupVerification(`Cancelled: ${error?.reason || 'unknown'}`))
+      verifier.on(VerifierEvent.Cancel, (error) => cleanupVerification(`Cancelled: ${error?.reason || error?.message || 'unknown'}`))
+
       await verifier.verify()
+      markThisDeviceVerified()
+      await refreshVerificationTruth()
+      cleanupVerification('Verified')
     } catch (error) {
       verifierRef.current = null
       setVerifyMsg(error?.message || String(error))
@@ -644,6 +749,19 @@ export default function FireChat() {
     try {
       await sasData?.confirm?.()
       setVerifyMsg('Confirmed. Waiting for the other device…')
+
+      const client = clientRef.current
+      if (client) {
+        for (let attempt = 0; attempt < 20; attempt += 1) {
+          const truth = await getDeviceVerifiedTruth(client)
+          if (truth === true) {
+            markThisDeviceVerified()
+            cleanupVerification('Verified')
+            return
+          }
+          await sleep(500)
+        }
+      }
     } catch (error) {
       setVerifyMsg(error?.message || String(error))
     }
@@ -651,7 +769,7 @@ export default function FireChat() {
 
   async function mismatchSas() {
     try {
-      await sasData?.mismatch?.()
+      sasData?.mismatch?.()
       cleanupVerification('Mismatch sent.')
     } catch (error) {
       setVerifyMsg(error?.message || String(error))
@@ -730,44 +848,63 @@ export default function FireChat() {
             <h2 className="section-title">Device verification</h2>
             {!cryptoReady ? (
               <div className="helper">Encryption is still initializing. Verification becomes available when Matrix crypto is ready.</div>
-            ) : deviceVerified && !verificationReq ? (
+            ) : deviceVerified ? (
               <>
                 <div className="helper">This FireChat session is verified for the account.</div>
-                <div className="verification-actions"><button className="btn" type="button" onClick={requestOwnVerification}>Re-verify</button></div>
-              </>
-            ) : verificationReq ? (
-              <>
-                <div className="helper">Verification with {verificationReq.otherUserId} · {verificationReq.otherDeviceId}</div>
-                {sasData?.emoji || sasData?.decimal ? (
-                  <>
-                    {sasData.emoji ? (
-                      <div className="sas-grid">
-                        {sasData.emoji.map(([emoji, name], index) => (
-                          <div className="sas-item" key={`${emoji}-${index}`}><div className="sas-emoji">{emoji}</div><div className="sas-name">{name}</div></div>
-                        ))}
-                      </div>
-                    ) : (
-                      <div className="helper">Code: {Array.isArray(sasData.decimal) ? sasData.decimal.join(' ') : ''}</div>
-                    )}
-                    <div className="verification-actions">
-                      <button className="btn primary" type="button" onClick={confirmSas}>Confirm match</button>
-                      <button className="btn" type="button" onClick={mismatchSas}>Doesn’t match</button>
-                    </div>
-                  </>
-                ) : (
-                  <div className="verification-actions">
-                    <button className="btn" type="button" onClick={acceptVerification}>Accept</button>
-                    <button className="btn" type="button" onClick={startSas}>Start SAS</button>
-                  </div>
-                )}
+                <div className="verification-actions"><button className="btn" type="button" onClick={requestOwnVerification}>Re-verify with emoji</button></div>
               </>
             ) : (
               <>
-                <div className="helper">Verify this device against another Matrix client signed into the same account.</div>
+                <div className="helper">If you have your Matrix recovery/security key, use it to trust this FireChat session directly.</div>
                 <div className="verification-actions">
-                  <button className="btn" type="button" onClick={requestOwnVerification}>Request verification</button>
-                  <button className="btn" type="button" onClick={checkPendingVerification}>Check pending</button>
+                  <input
+                    className="input"
+                    type="password"
+                    autoComplete="off"
+                    value={recoveryKey}
+                    onChange={(event) => setRecoveryKey(event.target.value)}
+                    placeholder="Recovery key"
+                    aria-label="Matrix recovery key"
+                  />
+                  <button className="btn primary" type="button" onClick={verifyWithRecoveryKey} disabled={!recoveryKey.trim() || recoveryBusy}>
+                    {recoveryBusy ? 'Verifying…' : 'Verify with recovery key'}
+                  </button>
                 </div>
+
+                <div className="helper" style={{ marginTop: 14 }}>Or verify from another trusted Matrix session with emoji.</div>
+
+                {verificationReq ? (
+                  <>
+                    <div className="helper" style={{ marginTop: 8 }}>Verification with {verificationReq.otherUserId}{verificationReq.otherDeviceId ? ` · ${verificationReq.otherDeviceId}` : ''}</div>
+                    {sasData?.emoji || sasData?.decimal ? (
+                      <>
+                        {sasData.emoji ? (
+                          <div className="sas-grid">
+                            {sasData.emoji.map(([emoji, name], index) => (
+                              <div className="sas-item" key={`${emoji}-${index}`}><div className="sas-emoji">{emoji}</div><div className="sas-name">{name}</div></div>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="helper">Code: {Array.isArray(sasData.decimal) ? sasData.decimal.join(' ') : ''}</div>
+                        )}
+                        <div className="verification-actions">
+                          <button className="btn primary" type="button" onClick={confirmSas}>Confirm match</button>
+                          <button className="btn" type="button" onClick={mismatchSas}>Doesn’t match</button>
+                        </div>
+                      </>
+                    ) : (
+                      <div className="verification-actions">
+                        {canAcceptVerificationRequest(verificationReq) && <button className="btn" type="button" onClick={acceptVerification}>Accept</button>}
+                        <button className="btn" type="button" onClick={startSas}>Start emoji verification</button>
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <div className="verification-actions">
+                    <button className="btn" type="button" onClick={requestOwnVerification}>Request emoji verification</button>
+                    <button className="btn" type="button" onClick={checkPendingVerification}>Check pending</button>
+                  </div>
+                )}
               </>
             )}
             {verifyMsg && <div className="helper status-line">{verifyMsg}</div>}
