@@ -150,6 +150,7 @@ export default function FireChatV2() {
 
   const clientRef = useRef(null)
   const verifierRef = useRef(null)
+  const sasFlowRef = useRef(null)
   const recoveryKeyRef = useRef(null)
   const authPasswordRef = useRef('')
   const newAccountRef = useRef(false)
@@ -266,6 +267,7 @@ export default function FireChatV2() {
     setVerificationReq(null)
     setSasData(null)
     verifierRef.current = null
+    sasFlowRef.current = null
 
     if (trust?.crossSigned) {
       setVerifyMsg(successMessage)
@@ -277,26 +279,39 @@ export default function FireChatV2() {
   }, [refreshVerification])
 
   const runSasVerification = useCallback(async (request) => {
-    if (!request || verifierRef.current) return
+    if (!request) return
+    if (sasFlowRef.current === request) return
+    if (sasFlowRef.current && sasFlowRef.current !== request) return
+
+    sasFlowRef.current = request
 
     try {
-      if (canAcceptVerificationRequest(request)) await request.accept()
+      if (!request.initiatedByMe && request.phase === VerificationPhase.Requested) {
+        try {
+          await request.accept()
+        } catch (error) {
+          if (![VerificationPhase.Ready, VerificationPhase.Started].includes(request.phase)) throw error
+        }
+      }
+
       setVerifyMsg(request.initiatedByMe ? 'Waiting for your trusted device to accept…' : 'Preparing emoji verification…')
 
       let verifier = request.verifier
       for (let attempt = 0; attempt < 80 && !verifier; attempt += 1) {
-        if (request.phase === VerificationPhase.Done) {
+        const phase = request.phase
+
+        if (phase === VerificationPhase.Done) {
           await finishVerification('Verified with emoji')
           return
         }
-        if (request.phase === VerificationPhase.Cancelled) throw new Error('Verification was cancelled')
+        if (phase === VerificationPhase.Cancelled) throw new Error('Verification was cancelled')
 
-        if (request.phase === VerificationPhase.Started && request.verifier) {
+        if (phase === VerificationPhase.Started && request.verifier) {
           verifier = request.verifier
           break
         }
 
-        if (request.phase === VerificationPhase.Ready) {
+        if (phase === VerificationPhase.Ready) {
           verifier = request.verifier || await request.startVerification('m.sas.v1')
           break
         }
@@ -318,6 +333,7 @@ export default function FireChatV2() {
 
       verifier.on(VerifierEvent.Cancel, (error) => {
         verifierRef.current = null
+        sasFlowRef.current = null
         setSasData(null)
         setVerificationReq(null)
         setVerifyMsg(`Verification cancelled: ${error?.reason || error?.message || 'unknown'}`)
@@ -327,10 +343,12 @@ export default function FireChatV2() {
         .then(() => finishVerification('Verified with emoji'))
         .catch((error) => {
           verifierRef.current = null
+          sasFlowRef.current = null
           setVerifyMsg(error?.message || String(error))
         })
     } catch (error) {
       verifierRef.current = null
+      sasFlowRef.current = null
       setVerifyMsg(error?.message || String(error))
     }
   }, [finishVerification])
@@ -425,6 +443,7 @@ export default function FireChatV2() {
           setVerificationReq(null)
           setSasData(null)
           verifierRef.current = null
+          sasFlowRef.current = null
           setVerifyMsg('Verification cancelled')
         } else if (request.initiatedByMe && [VerificationPhase.Ready, VerificationPhase.Started].includes(request.phase)) {
           void runSasVerification(request)
@@ -572,6 +591,8 @@ export default function FireChatV2() {
     try { client?.stopClient?.() } catch {}
     try { client?.removeAllListeners?.() } catch {}
     clientRef.current = null
+    verifierRef.current = null
+    sasFlowRef.current = null
     recoveryKeyRef.current = null
     authPasswordRef.current = ''
     newAccountRef.current = false
@@ -624,6 +645,8 @@ export default function FireChatV2() {
   async function requestEmojiVerification() {
     const crypto = clientRef.current?.getCrypto?.()
     if (!crypto) return
+    if (sasFlowRef.current) return
+
     try {
       const request = await crypto.requestOwnUserVerification()
       setVerificationReq(request)
@@ -631,12 +654,13 @@ export default function FireChatV2() {
       setVerifyMsg('Waiting for your trusted device to accept…')
       void runSasVerification(request)
     } catch (error) {
+      sasFlowRef.current = null
       setVerifyMsg(error?.message || String(error))
     }
   }
 
   async function acceptVerification() {
-    if (!verificationReq) return
+    if (!verificationReq || sasFlowRef.current) return
     void runSasVerification(verificationReq)
   }
 
@@ -654,6 +678,7 @@ export default function FireChatV2() {
     setSasData(null)
     setVerificationReq(null)
     verifierRef.current = null
+    sasFlowRef.current = null
     setVerifyMsg('Verification cancelled because the codes did not match.')
   }
 
