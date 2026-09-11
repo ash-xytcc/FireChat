@@ -4,7 +4,6 @@ import {
   CryptoEvent,
   VerificationPhase,
   VerifierEvent,
-  canAcceptVerificationRequest,
   decodeRecoveryKey,
 } from 'matrix-js-sdk/lib/crypto-api'
 
@@ -151,6 +150,7 @@ export default function FireChatV2() {
   const clientRef = useRef(null)
   const verifierRef = useRef(null)
   const sasFlowRef = useRef(null)
+  const outgoingVerificationRef = useRef(null)
   const recoveryKeyRef = useRef(null)
   const authPasswordRef = useRef('')
   const newAccountRef = useRef(false)
@@ -174,6 +174,23 @@ export default function FireChatV2() {
     setDeviceSupportsEncryption(trust.supportsEncryption)
     setDeviceVerified(trust.crossSigned)
     return trust
+  }, [])
+
+  const ensureOwnCrossSigningIdentity = useCallback(async () => {
+    const client = clientRef.current
+    const crypto = client?.getCrypto?.()
+    const userId = client?.getUserId?.()
+    if (!client || !crypto || !userId) return false
+
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      try {
+        const hasKeys = await crypto.userHasCrossSigningKeys(userId, true)
+        if (hasKeys) return true
+      } catch {}
+      await sleep(400)
+    }
+
+    return false
   }, [])
 
   const cacheMember = useCallback((roomId, mxid, info) => {
@@ -268,6 +285,7 @@ export default function FireChatV2() {
     setSasData(null)
     verifierRef.current = null
     sasFlowRef.current = null
+    outgoingVerificationRef.current = null
 
     if (trust?.crossSigned) {
       setVerifyMsg(successMessage)
@@ -284,9 +302,10 @@ export default function FireChatV2() {
     if (sasFlowRef.current && sasFlowRef.current !== request) return
 
     sasFlowRef.current = request
+    const outgoing = outgoingVerificationRef.current === request
 
     try {
-      if (!request.initiatedByMe && request.phase === VerificationPhase.Requested) {
+      if (!outgoing && request.phase === VerificationPhase.Requested) {
         try {
           await request.accept()
         } catch (error) {
@@ -294,7 +313,7 @@ export default function FireChatV2() {
         }
       }
 
-      setVerifyMsg(request.initiatedByMe ? 'Waiting for your trusted device to accept…' : 'Accepted. Start emoji verification on the other device.')
+      setVerifyMsg(outgoing ? 'Waiting for your trusted device to accept…' : 'Accepted. Start emoji verification on the trusted device.')
 
       let verifier = request.verifier
       for (let attempt = 0; attempt < 480 && !verifier; attempt += 1) {
@@ -315,7 +334,7 @@ export default function FireChatV2() {
         }
 
         if (phase === VerificationPhase.Ready) {
-          setVerifyMsg('Trusted device accepted. Start the emoji comparison on that device; FireChat will join it automatically.')
+          setVerifyMsg('Trusted device accepted. Start the emoji comparison there; FireChat will join it automatically.')
         }
 
         await sleep(250)
@@ -336,6 +355,7 @@ export default function FireChatV2() {
       verifier.on(VerifierEvent.Cancel, (error) => {
         verifierRef.current = null
         sasFlowRef.current = null
+        outgoingVerificationRef.current = null
         setSasData(null)
         setVerificationReq(null)
         const reason = error?.reason || error?.message || request.cancellationCode || 'unknown'
@@ -347,11 +367,13 @@ export default function FireChatV2() {
         .catch((error) => {
           verifierRef.current = null
           sasFlowRef.current = null
+          outgoingVerificationRef.current = null
           setVerifyMsg(error?.message || String(error))
         })
     } catch (error) {
       verifierRef.current = null
       sasFlowRef.current = null
+      outgoingVerificationRef.current = null
       setVerifyMsg(error?.message || String(error))
     }
   }, [finishVerification])
@@ -435,9 +457,15 @@ export default function FireChatV2() {
     }
 
     const onVerificationRequest = (request) => {
+      if (outgoingVerificationRef.current) {
+        const outgoing = outgoingVerificationRef.current
+        const sameTransaction = request.transactionId && outgoing.transactionId && request.transactionId === outgoing.transactionId
+        if (request === outgoing || sameTransaction) return
+      }
+
       setVerificationReq(request)
       setSasData(null)
-      setVerifyMsg(request.initiatedByMe ? 'Waiting for your trusted device to accept…' : 'Verification request received. Accept it to compare emojis.')
+      setVerifyMsg('Verification request received. Accept it to compare emojis.')
 
       request.on?.('change', () => {
         if (request.phase === VerificationPhase.Done) {
@@ -449,8 +477,6 @@ export default function FireChatV2() {
           sasFlowRef.current = null
           const reason = request.cancellationCode ? ` (${request.cancellationCode})` : ''
           setVerifyMsg(`Verification cancelled${reason}`)
-        } else if (request.initiatedByMe && [VerificationPhase.Ready, VerificationPhase.Started].includes(request.phase)) {
-          void runSasVerification(request)
         }
       })
     }
@@ -461,6 +487,7 @@ export default function FireChatV2() {
         setStatus('Connected')
         refreshRooms()
         void refreshVerification()
+        void ensureOwnCrossSigningIdentity()
       }
     }
 
@@ -505,7 +532,7 @@ export default function FireChatV2() {
       try { client.removeAllListeners?.() } catch {}
       if (clientRef.current === client) clientRef.current = null
     }
-  }, [finishVerification, loggedIn, refreshRooms, refreshVerification, runSasVerification, session, setupNewAccountSecurity])
+  }, [ensureOwnCrossSigningIdentity, finishVerification, loggedIn, refreshRooms, refreshVerification, session, setupNewAccountSecurity])
 
   async function signIn(event) {
     event.preventDefault()
@@ -597,6 +624,7 @@ export default function FireChatV2() {
     clientRef.current = null
     verifierRef.current = null
     sasFlowRef.current = null
+    outgoingVerificationRef.current = null
     recoveryKeyRef.current = null
     authPasswordRef.current = ''
     newAccountRef.current = false
@@ -647,17 +675,26 @@ export default function FireChatV2() {
   }
 
   async function requestEmojiVerification() {
-    const crypto = clientRef.current?.getCrypto?.()
-    if (!crypto) return
-    if (sasFlowRef.current) return
+    const client = clientRef.current
+    const crypto = client?.getCrypto?.()
+    if (!client || !crypto || sasFlowRef.current) return
 
     try {
+      setVerifyMsg('Loading your Matrix verification identity…')
+      const hasCrossSigning = await ensureOwnCrossSigningIdentity()
+      if (!hasCrossSigning) {
+        setVerifyMsg('Your account cross-signing identity is not available to this session yet. Keep a trusted Matrix session online and try again, or use your recovery key.')
+        return
+      }
+
       const request = await crypto.requestOwnUserVerification()
+      outgoingVerificationRef.current = request
       setVerificationReq(request)
       setSasData(null)
-      setVerifyMsg('Waiting for your trusted device to accept…')
+      setVerifyMsg('Verification request sent. Accept it on your trusted session, then start the emoji comparison there.')
       void runSasVerification(request)
     } catch (error) {
+      outgoingVerificationRef.current = null
       sasFlowRef.current = null
       setVerifyMsg(error?.message || String(error))
     }
@@ -683,6 +720,7 @@ export default function FireChatV2() {
     setVerificationReq(null)
     verifierRef.current = null
     sasFlowRef.current = null
+    outgoingVerificationRef.current = null
     setVerifyMsg('Verification cancelled because the codes did not match.')
   }
 
@@ -722,6 +760,8 @@ export default function FireChatV2() {
       : deviceVerified
         ? 'verified'
         : 'needs verification'
+
+  const verificationIsOutgoing = !!verificationReq && outgoingVerificationRef.current === verificationReq
 
   return (
     <div className="app-shell">
@@ -830,7 +870,7 @@ export default function FireChatV2() {
                           <button className="btn" type="button" onClick={mismatchSas}>Doesn’t match</button>
                         </div>
                       </>
-                    ) : !verificationReq.initiatedByMe ? (
+                    ) : !verificationIsOutgoing ? (
                       <div className="verification-actions">
                         <button className="btn primary" type="button" onClick={acceptVerification}>Accept & compare emojis</button>
                       </div>
